@@ -19,7 +19,7 @@ type HttpClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// Client ...
+// Client is a type for building an Endpoint to call a remote endpoint.
 type Client[T, R any] struct {
 	client           HttpClient
 	reqBuilder       CreateRequestFunc[T]
@@ -30,6 +30,7 @@ type Client[T, R any] struct {
 	traceEnabled     bool
 }
 
+// NewClient creates a
 func NewClient[T, R any](
 	method string,
 	uri *url.URL,
