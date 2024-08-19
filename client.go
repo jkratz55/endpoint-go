@@ -3,15 +3,10 @@ package endpoint
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptrace"
-	"net/url"
-	"time"
 )
 
 // HttpClient is an interface that defines a type capable of making HTTP requests.
@@ -19,33 +14,60 @@ type HttpClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// Client is a type for building an Endpoint to call a remote endpoint.
-type Client[T, R any] struct {
-	client           HttpClient
-	reqBuilder       CreateRequestFunc[T]
-	decoder          DecodeResponseFunc[R]
-	requestPrepared  []RequestPrepared
-	responseReceived []ResponseReceived
-	errFunc          OnError
-	traceEnabled     bool
+// ClientHooks is a type for defining hooks that are invoked during the lifecycle
+// of an Endpoint.
+type ClientHooks struct {
+
+	// BeforePrepareRequest is invoked before the request is prepared/initialized.
+	BeforePrepareRequest func(ctx context.Context)
+
+	// RequestPrepared is invoked after the request is prepared/initialized, but
+	// before it is sent to the server. The request can safely be modified.
+	RequestPrepared func(context.Context, *http.Request) context.Context
+
+	// BeforeSendRequest is invoked before the request is sent to the server.
+	BeforeSendRequest func(ctx context.Context)
+
+	// ResponseReceived is invoked after the response is received from the server
+	// but before the DecodeResponseFunc is invoked. ResponseReceived will not be
+	// invoked if the server never responds. Common reasons for this include network
+	// errors, timeouts, etc.
+	ResponseReceived func(context.Context, *http.Response) context.Context
+
+	// AfterDecodeResponse is invoked after the response is decoded.
+	ResponseDecoded func(ctx context.Context)
+
+	// Finalizer is invoked after the Endpoint has completed execution.
+	//
+	// If a response was not received from the server, the statusCode will be 0.
+	Finalizer func(ctx context.Context, statusCode int, err error)
+
+	// OnError is invoked when an error is returned by the implementation of the
+	// HttpClient interface.
+	OnError func(context.Context, error)
 }
 
-// NewClient creates a
+// Client is a type for building an Endpoint invoke a remote service over HTTP.
+type Client[T, R any] struct {
+	client     HttpClient
+	reqBuilder CreateRequestFunc[T]
+	decoder    DecodeResponseFunc[R]
+	hooks      ClientHooks
+}
+
+// NewClient initializes a new Client which acts as a builder for an Endpoint.
 func NewClient[T, R any](
 	method string,
-	uri *url.URL,
+	uri string,
 	encoder EncodeRequestFunc[T],
 	decoder DecodeResponseFunc[R],
 	opts ...ClientOptions[T, R]) *Client[T, R] {
 
 	client := &Client[T, R]{
-		client:           http.DefaultClient,
-		reqBuilder:       makeCreateRequest(method, uri, encoder),
-		decoder:          decoder,
-		requestPrepared:  make([]RequestPrepared, 0),
-		responseReceived: make([]ResponseReceived, 0),
-		errFunc:          func(ctx context.Context, err error) {},
-		traceEnabled:     false,
+		client:     http.DefaultClient,
+		reqBuilder: makeCreateRequest(method, uri, encoder),
+		decoder:    decoder,
+		hooks:      ClientHooks{},
 	}
 
 	for _, opt := range opts {
@@ -55,144 +77,135 @@ func NewClient[T, R any](
 	return client
 }
 
+// NewCustomRequestClient initializes a new Client with a custom
+// CreateRequestFunc. This gives the caller more control over how the request
+// are built.
+func NewCustomRequestClient[T, R any](
+	reqBuilder CreateRequestFunc[T],
+	decoder DecodeResponseFunc[R],
+	opts ...ClientOptions[T, R]) *Client[T, R] {
+
+	client := &Client[T, R]{
+		client:     http.DefaultClient,
+		reqBuilder: reqBuilder,
+		decoder:    decoder,
+		hooks:      ClientHooks{},
+	}
+
+	for _, opt := range opts {
+		opt(client)
+	}
+
+	return client
+}
+
+// Endpoint returns an Endpoint that can be used to invoke the remote service.
 func (c *Client[T, R]) Endpoint() Endpoint[T, R] {
 	return func(ctx context.Context, request T) (R, error) {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
 		var (
-			zero R
-
-			// Timestamps for httptrace
-			getConnStart time.Time
-			dnsStart     time.Time
-			connectStart time.Time
-			tlsStart     time.Time
-			reqSent      time.Time
-			start        time.Time
-
-			// Durations for httptrace
-			getConnDur time.Duration
-			connDur    time.Duration
-			dnsDur     time.Duration
-			tlsDur     time.Duration
-			serverDur  time.Duration
+			zero       R
+			statusCode int
+			err        error
 		)
-		start = time.Now()
+
+		if c.hooks.Finalizer != nil {
+			defer func() {
+				c.hooks.Finalizer(ctx, statusCode, err)
+			}()
+		}
+
+		if c.hooks.BeforePrepareRequest != nil {
+			c.hooks.BeforePrepareRequest(ctx)
+		}
 
 		req, err := c.reqBuilder(ctx, request)
 		if err != nil {
 			return zero, err
 		}
 
-		if c.traceEnabled {
-			clientTrace := &httptrace.ClientTrace{
-				GetConn: func(_ string) {
-					getConnStart = time.Now()
-				},
-				GotConn: func(info httptrace.GotConnInfo) {
-					getConnDur = time.Since(getConnStart)
-				},
-				GotFirstResponseByte: func() {
-					serverDur = time.Since(reqSent)
-				},
-				DNSStart: func(info httptrace.DNSStartInfo) {
-					dnsStart = time.Now()
-				},
-				DNSDone: func(info httptrace.DNSDoneInfo) {
-					dnsDur = time.Since(dnsStart)
-				},
-				ConnectStart: func(network, addr string) {
-					connectStart = time.Now()
-				},
-				ConnectDone: func(network, addr string, err error) {
-					connDur = time.Since(connectStart)
-				},
-				TLSHandshakeStart: func() {
-					tlsStart = time.Now()
-				},
-				TLSHandshakeDone: func(state tls.ConnectionState, err error) {
-					tlsDur = time.Since(tlsStart)
-				},
-				WroteRequest: func(info httptrace.WroteRequestInfo) {
-					reqSent = time.Now()
-				},
-			}
-			ctx = httptrace.WithClientTrace(ctx, clientTrace)
+		if c.hooks.RequestPrepared != nil {
+			ctx = c.hooks.RequestPrepared(ctx, req)
 		}
 
-		for _, fn := range c.requestPrepared {
-			ctx = fn(ctx, req)
+		if c.hooks.BeforeSendRequest != nil {
+			c.hooks.BeforeSendRequest(ctx)
 		}
 
 		resp, err := c.client.Do(req.WithContext(ctx))
 		if err != nil {
 			return zero, err
 		}
+		statusCode = resp.StatusCode
 
-		for _, fn := range c.responseReceived {
-			ctx = fn(ctx, resp)
+		if c.hooks.ResponseReceived != nil {
+			ctx = c.hooks.ResponseReceived(ctx, resp)
 		}
 
 		response, err := c.decoder(ctx, resp)
 		if err != nil {
+			err = fmt.Errorf("%w: %w", ErrDecodeResponse, err)
+			if c.hooks.OnError != nil {
+				c.hooks.OnError(ctx, err)
+			}
 			return zero, err
 		}
 
-		totalDur := time.Since(start)
-
-		if c.traceEnabled {
-			code := 0
-			if resp != nil {
-				code = resp.StatusCode
-			}
-			info := TraceInfo{
-				Method:           req.Method,
-				URL:              req.URL.String(),
-				StatusCode:       code,
-				Error:            err,
-				DNSLookup:        dnsDur,
-				ConnectionTime:   connDur,
-				TLSHandshake:     tlsDur,
-				ServerTime:       serverDur,
-				TotalTime:        totalDur,
-				ConnectionReused: false,
-				ConnectionIdle:   false,
-			}
-			fmt.Println(info)
+		if c.hooks.ResponseDecoded != nil {
+			c.hooks.ResponseDecoded(ctx)
 		}
 
 		return response, nil
 	}
 }
 
-func EncodeJSONRequest[T any](_ context.Context, r *http.Request, data T) error {
+// EncodeJSONRequest is a EncodeRequestFunc that encodes the request as JSON.
+func EncodeJSONRequest(_ context.Context, r *http.Request, data interface{}) error {
 	r.Header.Set("Content-Type", "application/json")
 	var buf bytes.Buffer
 	r.Body = io.NopCloser(&buf)
 	return json.NewEncoder(&buf).Encode(data)
 }
 
-func EncodeXMLRequest[T any](_ context.Context, r *http.Request, data T) error {
-	r.Header.Set("Content-Type", "application/xml")
-	var buf bytes.Buffer
-	r.Body = io.NopCloser(&buf)
-	return xml.NewEncoder(&buf).Encode(data)
-}
-
-func NopRequestEncoder[T any](_ context.Context, _ *http.Request, _ T) error {
+// NopRequestEncoder is a EncodeRequestFunc that does nothing and always returns
+// nil.
+func NopRequestEncoder(_ context.Context, _ *http.Request, _ interface{}) error {
 	return nil
 }
 
-func makeCreateRequest[T any](method string, uri *url.URL, encoder EncodeRequestFunc[T]) CreateRequestFunc[T] {
+// DecodeJSONResponse is a DecodeResponseFunc that decodes the response as JSON
+// into type R if the status code from the server is considered successful (2XX).
+// If the status code is not 2XX an HttpError is returned.
+func DecodeJSONResponse[R any](_ context.Context, resp *http.Response) (R, error) {
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		var data R
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			return data, err
+		}
+		return data, nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return *new(R), HttpError{
+		Status: resp.StatusCode,
+		Header: resp.Header,
+		Body:   body,
+	}
+}
+
+func makeCreateRequest[T any](method string, uri string, encoder EncodeRequestFunc[T]) CreateRequestFunc[T] {
 	return func(ctx context.Context, request T) (*http.Request, error) {
-		req, err := http.NewRequest(method, uri.String(), nil)
+		req, err := http.NewRequest(method, uri, nil)
 		if err != nil {
 			return nil, err
 		}
 
 		if err := encoder(ctx, req, request); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrEncodeRequest, err)
 		}
 
 		return req, nil
