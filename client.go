@@ -61,7 +61,7 @@ func NewClient[T, R any](
 	uri string,
 	encoder EncodeRequestFunc[T],
 	decoder DecodeResponseFunc[R],
-	opts ...ClientOptions[T, R]) *Client[T, R] {
+	opts ...ClientOption[T, R]) *Client[T, R] {
 
 	client := &Client[T, R]{
 		client:     http.DefaultClient,
@@ -83,7 +83,7 @@ func NewClient[T, R any](
 func NewCustomRequestClient[T, R any](
 	reqBuilder CreateRequestFunc[T],
 	decoder DecodeResponseFunc[R],
-	opts ...ClientOptions[T, R]) *Client[T, R] {
+	opts ...ClientOption[T, R]) *Client[T, R] {
 
 	client := &Client[T, R]{
 		client:     http.DefaultClient,

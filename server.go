@@ -14,6 +14,8 @@ import (
 // response to the client.
 type ErrorHandler func(ctx context.Context, w http.ResponseWriter, err error)
 
+// ServerHooks is a type for defining hooks that are invoked during the lifecycle
+// of an Endpoint when it is invoked by a server.
 type ServerHooks struct {
 
 	// BeforeDecodeRequest is invoked before the request is decoded. It is not
@@ -37,6 +39,8 @@ type ServerHooks struct {
 	Finalizer func(ctx context.Context, statusCode int, r *http.Request)
 }
 
+// Server is an implementation of the http.Handler interface that is responsible
+// for processing HTTP requests and invoking the endpoint.
 type Server[T, R any] struct {
 	endpoint     Endpoint[T, R]
 	decoder      DecodeRequestFunc[T]
@@ -49,7 +53,8 @@ type Server[T, R any] struct {
 func NewServer[T, R any](
 	e Endpoint[T, R],
 	d DecodeRequestFunc[T],
-	enc EncodeResponseFunc[R]) *Server[T, R] {
+	enc EncodeResponseFunc[R],
+	opts ...ServerOption[T, R]) *Server[T, R] {
 
 	s := &Server[T, R]{
 		endpoint:     e,
@@ -58,7 +63,9 @@ func NewServer[T, R any](
 		errorHandler: defaultServerErrorHandler(),
 	}
 
-	// todo: allow opts/hooks
+	for _, opt := range opts {
+		opt(s)
+	}
 
 	return s
 }
@@ -163,6 +170,7 @@ func defaultServerErrorHandler() ErrorHandler {
 	}
 }
 
+// EncodeJSONResponse is an EncodeResponseFunc that encodes the response as JSON.
 func EncodeJSONResponse(ctx context.Context, w http.ResponseWriter, data interface{}) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
